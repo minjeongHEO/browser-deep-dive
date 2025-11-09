@@ -11,7 +11,10 @@ class ConnectionManager:
     key = (host, port)
     
     if key in self.connections:
-      return self.connections[key]
+      s = self.connections[key]
+      # 기존 연결에도 타임아웃 설정
+      s.settimeout(10.0)
+      return s
     
     # 새 연결 생성
     s = socket.socket(
@@ -19,6 +22,7 @@ class ConnectionManager:
       type=socket.SOCK_STREAM,
       proto=socket.IPPROTO_TCP
     )
+    s.settimeout(10.0)  # 연결 타임아웃 설정
     s.connect((host, port))
     
     if scheme == "https":
@@ -168,17 +172,40 @@ class URL:
     """HTTP/HTTPS 요청 처리 (연결 재사용)"""
     # 연결 관리자에서 소켓 가져오기 (재사용 또는 새로 생성)
     s = connection_manager.get_connection(self.host, self.port, self.scheme)
+    
+    # 타임아웃 설정 (10초)
+    s.settimeout(10.0)
 
-    # 서버에 요청 보내기 (Connection: close 제거)
+    # 서버에 요청 보내기
     request = "GET {} HTTP/1.1\r\n".format(self.path)
     request += "Host: {}\r\n".format(self.host)
     request += "User-Agent: Woody-Browser/1.0\r\n"
+    request += "Connection: close\r\n"  # 연결 재사용 문제 해결을 위해 close 사용
     request += "\r\n"
-    s.send(request.encode("utf8"))
+    
+    try:
+      s.send(request.encode("utf8"))
+    except (BrokenPipeError, OSError):
+      # 연결이 끊어진 경우 새로 연결
+      connection_manager.close_connection(self.host, self.port)
+      s = connection_manager.get_connection(self.host, self.port, self.scheme)
+      s.settimeout(10.0)
+      s.send(request.encode("utf8"))
 
     # 데이터가 도착할 떄마다 수집하는 루프
-    response = s.makefile("r", encoding="utf8", newline="\r\n")  # socket.read 대신 파이썬에서는 소켓상태를 확인하는 루프 헬퍼 함수(makefile)를 사용
+    # 매 요청마다 새로운 makefile 생성
+    response = s.makefile("r", encoding="utf8", newline="\r\n")
     statusLine = response.readline()
+    
+    if not statusLine:
+      # 응답이 없으면 연결이 끊어진 것, 새로 연결
+      connection_manager.close_connection(self.host, self.port)
+      s = connection_manager.get_connection(self.host, self.port, self.scheme)
+      s.settimeout(10.0)
+      s.send(request.encode("utf8"))
+      response = s.makefile("r", encoding="utf8", newline="\r\n")
+      statusLine = response.readline()
+    
     version, status, explanation = statusLine.split(" ", 2)
 
     # 헤더 처리(헤더는 대소문자 구분하지 않기 때문에 소문자로 통일)
@@ -200,6 +227,9 @@ class URL:
       # Content-Length가 없으면 연결을 닫고 모든 데이터 읽기
       body = response.read()
       connection_manager.close_connection(self.host, self.port)
+    
+    # Connection: close를 사용했으므로 연결 닫기
+    connection_manager.close_connection(self.host, self.port)
 
     return body
 
